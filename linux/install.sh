@@ -34,24 +34,43 @@ start_existing() {
     for dev in /sys/class/net/*; do
         driver=$(basename "$(readlink "$dev/device/driver" 2>/dev/null)" 2>/dev/null || true)
         case "$driver" in
-            rndis_host|cdc_ncm) systemctl start "openwebcam@$(basename "$dev").service" ;;
+            rndis_host|cdc_ncm) systemctl restart "openwebcam@$(basename "$dev").service" ;;
         esac
     done
 }
 
-do_install() {
-    # Build (incremental) as the invoking user so the build folder isn't owned by root.
-    as_user=""
-    if [ -n "${SUDO_USER:-}" ]; then as_user="sudo -u $SUDO_USER"; fi
-    $as_user cmake -S "$here" -B "$build"
-    $as_user cmake --build "$build"
+check_prerequisites() {
+    missing=""
+    if ! command -v cmake >/dev/null 2>&1; then missing="$missing cmake"; fi
+    if ! command -v pkg-config >/dev/null 2>&1 && ! command -v pkgconf >/dev/null 2>&1; then missing="$missing pkg-config"; fi
+    if ! command -v c++ >/dev/null 2>&1 && ! command -v g++ >/dev/null 2>&1 && ! command -v clang++ >/dev/null 2>&1; then missing="$missing g++"; fi
+    if ! modinfo v4l2loopback >/dev/null 2>&1; then missing="$missing v4l2loopback"; fi
+    if command -v pkg-config >/dev/null 2>&1; then
+        if ! pkg-config --exists libavcodec libswscale libavutil 2>/dev/null; then
+            missing="$missing ffmpeg-dev"
+        fi
+    fi
 
-    if ! modinfo v4l2loopback >/dev/null 2>&1; then
-        echo "v4l2loopback is not installed. Install it first, e.g.:"
-        echo "  Debian/Ubuntu: sudo apt install v4l2loopback-dkms"
-        echo "  Fedora:        sudo dnf install v4l2loopback"
-        echo "  Arch:          sudo pacman -S v4l2loopback-dkms"
+    if [ -n "$missing" ]; then
+        echo "Missing prerequisites:$missing"
+        echo "Please install them first, e.g.:"
+        echo "  Arch/EndeavourOS: sudo pacman -S cmake gcc pkgconf ffmpeg v4l2loopback-dkms"
+        echo "  Debian/Ubuntu:    sudo apt install cmake g++ pkg-config libavcodec-dev libswscale-dev libavutil-dev v4l2loopback-dkms"
+        echo "  Fedora:           sudo dnf install cmake gcc-c++ ffmpeg-devel v4l2loopback"
         exit 1
+    fi
+}
+
+do_install() {
+    check_prerequisites
+
+    # Build (incremental) as the invoking user so the build folder isn't owned by root.
+    if [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" cmake -S "$here" -B "$build"
+        sudo -u "$SUDO_USER" cmake --build "$build"
+    else
+        cmake -S "$here" -B "$build"
+        cmake --build "$build"
     fi
 
     install -m 755 "$build/openwebcam" "$bin"
