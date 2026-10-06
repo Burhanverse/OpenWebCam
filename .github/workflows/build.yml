@@ -189,6 +189,11 @@ jobs:
           TAG: v${{ needs.version.outputs.version }}
         run: |
           # Creates the tag on this commit. Tags pushed with GITHUB_TOKEN don't trigger another run.
-          gh release create "$TAG" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
-            --title "OpenWebCam $TAG" --notes-file dist/notes.md --clobber \
-            dist/OpenWebCam-windows-x64.zip dist/OpenWebCam-windows-ARM64.zip dist/OpenWebCam-linux.tar.gz dist/OpenWebCam-android.apk
+          assets="dist/OpenWebCam-windows-x64.zip dist/OpenWebCam-windows-ARM64.zip dist/OpenWebCam-linux.tar.gz dist/OpenWebCam-android.apk"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # Re-run: replace assets on the existing release.
+            gh release upload "$TAG" --repo "${{ github.repository }}" --clobber $assets
+          else
+            gh release create "$TAG" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+              --title "OpenWebCam $TAG" --notes-file dist/notes.md $assets
+          fi
