@@ -9,6 +9,7 @@ CMakeUserPresets.json
 .gradle/
 .kotlin/
 local.properties
+keystore.properties
 
 # Release artifacts and signing
 *.apk

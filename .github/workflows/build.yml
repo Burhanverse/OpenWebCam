@@ -1,13 +1,97 @@
 name: build
 
+# Every push to main builds, picks the next version from the commit messages,
+# tags it and publishes a GitHub release with a changelog. PRs only build.
+#
+# Version bump since the last v* tag (Conventional Commits):
+#   "feat!: ..." / "BREAKING CHANGE" in a body -> major
+#   "feat: ..."                                 -> minor
+#   anything else                               -> patch
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    paths-ignore: ["**.md", ".gitignore"]
   pull_request:
   workflow_dispatch:
 
+# Releases run one at a time so two quick pushes can't claim the same version.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      code: ${{ steps.next.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute next version and changelog
+        id: next
+        run: |
+          last=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)
+          if [ -z "$last" ]; then
+            # First automated release: start from the version in app/build.gradle.kts.
+            version=$(grep -oP 'versionName = .*?"\K[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle.kts)
+            range=HEAD
+          else
+            IFS=. read -r major minor patch <<< "${last#v}"
+            range="$last..HEAD"
+            log=$(git log --no-merges --format='%s%n%b' "$range")
+            if grep -qE '^[a-z]+(\([^)]*\))?!:|BREAKING CHANGE' <<< "$log"; then
+              version="$((major + 1)).0.0"
+            elif grep -qE '^feat(\([^)]*\))?:' <<< "$log"; then
+              version="$major.$((minor + 1)).0"
+            else
+              version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+          IFS=. read -r major minor patch <<< "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "code=$((major * 10000 + minor * 100 + patch))" >> "$GITHUB_OUTPUT"
+          echo "Next version: v$version (last: ${last:-none})"
+
+          # Changelog grouped by commit type; the type prefix is stripped.
+          breaking='^[a-z]+(\([^)]*\))?!:'
+          feat='^feat(\([^)]*\))?:'
+          fix='^fix(\([^)]*\))?:'
+          perf='^perf(\([^)]*\))?:'
+          section() {  # title, grep flags
+            local title=$1 lines
+            shift
+            lines=$(git log --no-merges --format='%s|%h' "$range" | grep "$@" |
+              sed -E 's/^[a-z]+(\([^)]*\))?!?: *//; s/^(.)/\U\1/; s/\|([0-9a-f]+)$/ (\1)/; s/^/- /' || true)
+            if [ -n "$lines" ]; then printf '### %s\n\n%s\n\n' "$title" "$lines" >> notes.md; fi
+          }
+          : > notes.md
+          section "Breaking changes" -E "$breaking"
+          section "Features"         -E "$feat"
+          section "Fixes"            -E "$fix"
+          section "Performance"      -E "$perf"
+          section "Other changes"    -vE "$breaking|$feat|$fix|$perf"
+          [ -s notes.md ] || printf 'Maintenance release.\n\n' > notes.md
+          cat >> notes.md <<EOF
+          ### Downloads
+
+          | File | For |
+          |---|---|
+          | \`OpenWebCam-android.apk\` | Android 10 or later |
+          | \`OpenWebCam-windows-x64.zip\` | Windows 11 on Intel / AMD |
+          | \`OpenWebCam-windows-ARM64.zip\` | Windows 11 on ARM |
+          EOF
+          if [ -n "$last" ]; then
+            echo "" >> notes.md
+            echo "**Full changelog:** https://github.com/${{ github.repository }}/compare/$last...v$version" >> notes.md
+          fi
+          cat notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+
   windows:
     runs-on: windows-latest
     strategy:
@@ -32,6 +116,7 @@ jobs:
           path: dist/*
 
   android:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,8 +124,27 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Decode signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          IS_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "SIGNING_STORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          elif [ "$IS_RELEASE" = true ]; then
+            echo "::error::KEYSTORE_BASE64 secret is missing; refusing to publish a debug-signed release"
+            exit 1
+          fi
       - name: Build APK
-        run: bash ./gradlew --no-daemon :app:assembleRelease
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: >
+          bash ./gradlew --no-daemon :app:assembleRelease
+          -PversionName=${{ needs.version.outputs.version }}
+          -PversionCode=${{ needs.version.outputs.code }}
       - name: Package
         run: |
           mkdir dist
@@ -51,8 +155,8 @@ jobs:
           path: dist/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, android]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [version, windows, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -64,6 +168,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.version.outputs.version }}
         run: |
-          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes \
+          # Creates the tag on this commit. Tags pushed with GITHUB_TOKEN don't trigger another run.
+          gh release create "$TAG" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "OpenWebCam $TAG" --notes-file dist/notes.md \
             dist/OpenWebCam-windows-x64.zip dist/OpenWebCam-windows-ARM64.zip dist/OpenWebCam-android.apk
