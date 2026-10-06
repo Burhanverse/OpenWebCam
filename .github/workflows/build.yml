@@ -122,7 +122,9 @@ jobs:
       - name: Check installer syntax
         run: sh -n linux/install.sh
       - name: Check service syntax
-        run: systemd-analyze verify linux/openwebcam@.service
+        run: |
+          sudo install -m 755 build/linux/openwebcam /usr/local/bin/openwebcam
+          systemd-analyze verify linux/openwebcam@.service
       - name: Package
         run: |
           chmod +x linux/install.sh
