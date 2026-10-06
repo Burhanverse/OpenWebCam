@@ -11,6 +11,7 @@
 #include <linux/videodev2.h>
 #include <net/route.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -130,6 +131,17 @@ int ConnectWithTimeout(const std::string& host, int timeoutMs) {
     fcntl(s, F_SETFL, fcntl(s, F_GETFL) & ~O_NONBLOCK);
     timeval tv{2, 0};  // stream runs at 30 fps; 2 s of silence = dead link
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    // Disable Nagle algorithm and quicken ACKs to minimize network latency.
+    int nodelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
+#ifdef TCP_QUICKACK
+    setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &nodelay, sizeof nodelay);
+#endif
+    // Keep socket buffer bounded to prevent stale frames accumulating during temporary hiccups.
+    int rcvbuf = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+
     return s;
 }
 
@@ -270,7 +282,9 @@ public:
         frame_ = av_frame_alloc();
         if (!ctx_ || !pkt_ || !frame_) return false;
         ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
-        ctx_->thread_type = FF_THREAD_SLICE;  // frame threading would add a frame of latency per thread
+        ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
+        ctx_->thread_type = FF_THREAD_SLICE;  // slice threading has zero frame latency
+        ctx_->thread_count = 0;               // automatic multi-core slice decoding
         return avcodec_open2(ctx_, codec, nullptr) == 0;
     }
 
@@ -292,24 +306,45 @@ private:
 };
 
 // Clockwise rotation of one 8-bit plane (sw x sh) into d, row stride dstride.
+// Uses cache-friendly block tiling and hoists rotation checks outside loops.
 void RotatePlane(const uint8_t* s, int sw, int sh, int rotation, uint8_t* d, int dstride) {
-    const bool swap = rotation != 180;
-    const int ow = swap ? sh : sw, oh = swap ? sw : sh;
-    for (int y = 0; y < oh; ++y) {
-        uint8_t* row = d + y * dstride;
-        for (int x = 0; x < ow; ++x) {
-            int sx, sy;
-            if (rotation == 90) {
-                sx = y;
-                sy = sh - 1 - x;
-            } else if (rotation == 180) {
-                sx = sw - 1 - x;
-                sy = sh - 1 - y;
-            } else {  // 270
-                sx = sw - 1 - y;
-                sy = x;
+    if (rotation == 180) {
+        for (int y = 0; y < sh; ++y) {
+            uint8_t* row = d + y * dstride;
+            const uint8_t* src_row = s + (sh - 1 - y) * sw;
+            for (int x = 0; x < sw; ++x) row[x] = src_row[sw - 1 - x];
+        }
+        return;
+    }
+
+    const int ow = sh, oh = sw;
+    constexpr int BLOCK = 32;
+
+    if (rotation == 90) {
+        for (int by = 0; by < oh; by += BLOCK) {
+            int max_y = std::min(by + BLOCK, oh);
+            for (int bx = 0; bx < ow; bx += BLOCK) {
+                int max_x = std::min(bx + BLOCK, ow);
+                for (int y = by; y < max_y; ++y) {
+                    uint8_t* row = d + y * dstride;
+                    for (int x = bx; x < max_x; ++x) {
+                        row[x] = s[(sh - 1 - x) * sw + y];
+                    }
+                }
             }
-            row[x] = s[sy * sw + sx];
+        }
+    } else if (rotation == 270) {
+        for (int by = 0; by < oh; by += BLOCK) {
+            int max_y = std::min(by + BLOCK, oh);
+            for (int bx = 0; bx < ow; bx += BLOCK) {
+                int max_x = std::min(bx + BLOCK, ow);
+                for (int y = by; y < max_y; ++y) {
+                    uint8_t* row = d + y * dstride;
+                    for (int x = bx; x < max_x; ++x) {
+                        row[x] = s[x * sw + (sw - 1 - y)];
+                    }
+                }
+            }
         }
     }
 }
@@ -330,13 +365,16 @@ public:
         const int sw = swap ? dh : dw, sh = swap ? dw : dh;  // scaled size before rotation
 
         sws_ = sws_getCachedContext(sws_, f->width, f->height, static_cast<AVPixelFormat>(f->format), sw, sh,
-                                    AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                                    AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws_) return false;
 
         const size_t ySize = static_cast<size_t>(ow) * oh;
         out.resize(ySize * 3 / 2);
-        std::fill(out.begin(), out.begin() + ySize, 16);  // black
-        std::fill(out.begin() + ySize, out.end(), 128);
+        // Letterbox margins only need clearing when the frame doesn't fill the output buffer.
+        if (dw != ow || dh != oh) {
+            std::fill(out.begin(), out.begin() + ySize, 16);  // black
+            std::fill(out.begin() + ySize, out.end(), 128);
+        }
         const int x0 = ((ow - dw) / 2) & ~1, y0 = ((oh - dh) / 2) & ~1;
         uint8_t* planes[3] = {out.data() + y0 * ow + x0, out.data() + ySize + (y0 / 2) * (ow / 2) + x0 / 2,
                               out.data() + ySize * 5 / 4 + (y0 / 2) * (ow / 2) + x0 / 2};
