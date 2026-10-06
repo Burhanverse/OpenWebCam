@@ -81,6 +81,7 @@ jobs:
           | \`OpenWebCam-android.apk\` | Android 10 or later |
           | \`OpenWebCam-windows-x64.zip\` | Windows 11 on Intel / AMD |
           | \`OpenWebCam-windows-ARM64.zip\` | Windows 11 on ARM |
+          | \`OpenWebCam-linux.tar.gz\` | Linux (builds on install, see README) |
           EOF
           if [ -n "$last" ]; then
             echo "" >> notes.md
@@ -113,6 +114,33 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: openwebcam-windows-${{ matrix.arch }}
+          path: dist/*
+
+  # Built on the oldest and newest supported Ubuntu (FFmpeg 4.4 and 6.1) to catch
+  # API drift. Users build from source (FFmpeg's ABI differs per distro), so the
+  # release ships the linux/ folder, not a binary.
+  linux:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ pkg-config libavcodec-dev libavutil-dev libswscale-dev
+      - name: Build
+        run: cmake -S linux -B build/linux && cmake --build build/linux
+      - name: Check installer syntax
+        run: sh -n linux/install.sh
+      - name: Package
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          mkdir dist
+          tar -czf dist/OpenWebCam-linux.tar.gz linux
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-24.04'
+        with:
+          name: openwebcam-linux
           path: dist/*
 
   android:
@@ -156,7 +184,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [version, windows, android]
+    needs: [version, windows, linux, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -173,4 +201,4 @@ jobs:
           # Creates the tag on this commit. Tags pushed with GITHUB_TOKEN don't trigger another run.
           gh release create "$TAG" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
             --title "OpenWebCam $TAG" --notes-file dist/notes.md \
-            dist/OpenWebCam-windows-x64.zip dist/OpenWebCam-windows-ARM64.zip dist/OpenWebCam-android.apk
+            dist/OpenWebCam-windows-x64.zip dist/OpenWebCam-windows-ARM64.zip dist/OpenWebCam-linux.tar.gz dist/OpenWebCam-android.apk

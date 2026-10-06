@@ -1,0 +1,2 @@
+# Start OpenWebCam when an Android USB tethering interface (RNDIS or NCM) appears.
+ACTION=="add", SUBSYSTEM=="net", DRIVERS=="rndis_host|cdc_ncm", TAG+="systemd", ENV{SYSTEMD_WANTS}+="openwebcam@%k.service"

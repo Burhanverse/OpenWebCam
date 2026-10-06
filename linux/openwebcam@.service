@@ -1,0 +1,13 @@
+# Started by 90-openwebcam.rules when a USB tethering interface appears;
+# stopped automatically when it goes away.
+[Unit]
+Description=OpenWebCam phone camera on %i
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+
+[Service]
+ExecStart=/usr/local/bin/openwebcam --interface %i
+DynamicUser=yes
+SupplementaryGroups=video
+Restart=on-failure
+RestartSec=2

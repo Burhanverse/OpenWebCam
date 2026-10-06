@@ -11,6 +11,7 @@ installation and everyday use, see [README.md](README.md).
 - [Android app](#android-app)
 - [Wire protocol](#wire-protocol)
 - [Windows virtual camera](#windows-virtual-camera)
+- [Linux receiver](#linux-receiver)
 - [Installer](#installer)
 - [Diagnostic tool](#diagnostic-tool)
 - [Building](#building)
@@ -66,7 +67,12 @@ windows/
     setup.manifest           Requests administrator rights
   probe/
     owc_probe.cpp            owc-probe.exe: command-line stream tester
-.github/workflows/build.yml  CI builds and tagged releases
+linux/
+  openwebcam.cpp           Receiver: phone → v4l2loopback device
+  install.sh               Build + install / uninstall
+  openwebcam@.service, 90-openwebcam.rules, 90-openwebcam.conf
+                           systemd unit, udev trigger, NetworkManager metric
+.github/workflows/build.yml  CI builds and automatic releases
 ```
 
 ## Android app
@@ -184,9 +190,11 @@ service, so changes take effect without stopping the stream.
 
 ### Release build
 
-R8 minification and resource shrinking are enabled. The APK is signed with
-the debug key, so CI can produce an installable APK without a private
-keystore.
+R8 minification and resource shrinking are enabled. The release signing key
+comes from `keystore.properties` (local, gitignored) or `SIGNING_*`
+environment variables (CI). Without either, the build falls back to the
+debug key. `-PversionName`/`-PversionCode` override the version (CI sets them
+from the release tag).
 
 ## Wire protocol
 
@@ -396,6 +404,52 @@ Frame Server. It:
 - prints resolution, fps, Mbit/s, and average decode latency every 10 s,
 - writes the 60th frame, before rotation, to `frame.bmp` (BT.601 → RGB).
 
+## Linux receiver
+
+Linux has no on-demand virtual camera API, so the Linux side is a small
+userspace program, `openwebcam` (`linux/openwebcam.cpp`), that writes into a
+**v4l2loopback** device. Apps read `/dev/video10` like any webcam.
+
+```
+phone :5000 ──► openwebcam ──► /dev/video10 (v4l2loopback, "OpenWebCam") ──► apps
+                 discovery, H.264 decode (libavcodec),
+                 scale (libswscale), rotate, letterbox → I420
+```
+
+It speaks the same wire protocol and follows the same rules as the Windows
+camera:
+
+- **Discovery:** gateways from `/proc/net/route`. Interfaces whose driver is
+  `rndis_host` or `cdc_ncm` come first. `--interface` restricts the search to
+  one interface. A host counts as the phone only if its first packet is a
+  valid INFO.
+- **Decoding:** FFmpeg's H.264 decoder with `AV_CODEC_FLAG_LOW_DELAY` and no
+  frame threading, so there is no reorder delay. Packets before the first
+  SPS/PPS + IDR are rejected by the decoder and skipped. The decoder is
+  recreated when INFO reports a new size.
+- **Fitting:** libswscale scales the frame, keeping the aspect ratio, before
+  rotation, so rotation runs on the smaller image. A CPU loop rotates each
+  plane, and the result is centered on black.
+- **Output:** I420 at a fixed size, 1920x1080 by default (`--size` changes
+  it). v4l2loopback has one format per device, so apps can't pick a size the
+  way they can on Windows.
+- **No signal:** color bars at 10 fps after one second without a frame.
+
+### Lifecycle
+
+| File | Installed to | Role |
+|---|---|---|
+| `90-openwebcam.rules` | `/etc/udev/rules.d/` | When an `rndis_host`/`cdc_ncm` interface appears, starts `openwebcam@<iface>.service` |
+| `openwebcam@.service` | `/etc/systemd/system/` | Runs `openwebcam --interface <iface>`. `BindsTo` the interface, so it stops on unplug. `DynamicUser` with the `video` group. |
+| `90-openwebcam.conf` | `/etc/NetworkManager/conf.d/` | Route metric 1000 on tethering interfaces, so Wi-Fi/Ethernet keep the internet traffic. Applies to every USB port, unlike Windows. |
+| (generated) | `/etc/modprobe.d/openwebcam.conf` | `video_nr=10 card_label=OpenWebCam exclusive_caps=1` (Chrome lists only capture-only devices) |
+| (generated) | `/etc/modules-load.d/openwebcam.conf` | Loads v4l2loopback at boot |
+
+`linux/install.sh` builds with CMake as the invoking user, installs the files
+above, loads the module, and starts the service for any tethering interface
+already up. `uninstall` removes all of it. It unloads v4l2loopback only if the
+module is the OpenWebCam instance.
+
 ## Building
 
 ### Windows
@@ -429,16 +483,35 @@ Requires JDK 17.
 Output: `app/build/outputs/apk/release/app-release.apk`. Built with Android
 Gradle Plugin 8.13, Kotlin 2.2, and the Compose BOM.
 
+### Linux
+
+Requires CMake 3.16+, a C++17 compiler, pkg-config, and the FFmpeg
+development packages (libavcodec, libavutil, libswscale). Tested in CI with
+FFmpeg 4.4 and 6.1.
+
+```sh
+cmake -S linux -B build/linux
+cmake --build build/linux
+```
+
 ### CI
 
-`.github/workflows/build.yml` runs on pushes to `main`, pull requests, and
-`v*` tags:
+`.github/workflows/build.yml` runs on pushes to `main` (except
+documentation-only changes), pull requests, and manual runs:
 
+- **version**: works out the next version from Conventional Commit messages
+  since the last `v*` tag (`feat!`/`BREAKING CHANGE` → major, `feat` → minor,
+  anything else → patch) and writes a grouped changelog.
 - **windows**: matrix over x64 and ARM64. Produces
   `OpenWebCam-windows-<arch>.zip` (DLL + setup) and `owc-probe-<arch>.exe`.
-- **android**: produces `OpenWebCam-android.apk`.
-- **release** (tags only): creates a GitHub release with auto-generated notes
-  and attaches both zips and the APK.
+- **linux**: builds on Ubuntu 22.04 and 24.04 and packages the `linux/`
+  folder as `OpenWebCam-linux.tar.gz`. Users build on install because
+  FFmpeg's ABI differs between distros.
+- **android**: produces `OpenWebCam-android.apk`, signed with the release key
+  from repository secrets (`KEYSTORE_BASE64`, `SIGNING_*`). It falls back to
+  the debug key for pull requests and refuses to release without the key.
+- **release** (pushes to `main` only): tags the commit and publishes a GitHub
+  release with the changelog, both zips, the Linux tarball, and the APK.
 
 ## Design decisions
 
@@ -464,14 +537,17 @@ Gradle Plugin 8.13, Kotlin 2.2, and the Compose BOM.
 
 ## Limitations
 
-- Requires Windows 11, since the virtual camera API does not exist on Windows
-  10. "N" editions need the Media Feature Pack.
+- Windows needs Windows 11, since the virtual camera API does not exist on
+  Windows 10. "N" editions need the Media Feature Pack.
+- Linux needs v4l2loopback, an out-of-tree kernel module. With Secure Boot,
+  the DKMS module must be signed. The output size is fixed per device.
+- Linux discovery needs a gateway route through the phone. Setting
+  `ipv4.never-default` on the tethering connection removes it (raise the
+  route metric instead, as the installer does).
 - The frame rate is fixed at 30 fps.
 - Video only, no audio.
 - Only one PC can stream at a time. The newest connection wins.
 - USB only. Wi-Fi discovery is not implemented, although the protocol itself
   would work over any IPv4 link if the phone were the gateway.
 - Decoding, rotation, and scaling run on the CPU in the Frame Server process.
-- The APK is signed with a debug key, so it cannot be updated through an app
-  store.
 - No camera controls (zoom, focus, exposure) are exposed to Windows.
