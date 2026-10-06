@@ -119,6 +119,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ pkg-config libavcodec-dev libavutil-dev libswscale-dev
       - name: Build
         run: cmake -S linux -B build/linux && cmake --build build/linux
+      - name: Check installer syntax
+        run: sh -n linux/install.sh
+      - name: Check service syntax
+        run: |
+          sudo install -m 755 build/linux/openwebcam /usr/local/bin/openwebcam
+          systemd-analyze verify linux/openwebcam@.service
       - name: Package
         run: |
           chmod +x linux/install.sh
