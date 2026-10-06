@@ -1,0 +1,37 @@
+# Build output (Gradle and CMake)
+build/
+out/
+dist/
+.cxx/
+CMakeUserPresets.json
+
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+local.properties
+
+# Release artifacts and signing
+*.apk
+*.aab
+*.zip
+*.exe
+*.dll
+*.pdb
+*.jks
+*.keystore
+
+# IDEs
+.idea/
+*.iml
+.vs/
+.vscode/
+
+# Probe and test output
+*.h264
+frame.bmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
